@@ -20,6 +20,22 @@ flags targeting the Strix Halo microarchitecture.
 | **Disk** | ~100 GB free for build artifacts |
 | **Kernel** | Linux 7.0+ (amdgpu + amdxdna loaded) |
 
+## Performance (gfx1151, 40 CUs, unified LPDDR5X)
+
+Benchmarked with FULL CUDA graph capture, ALL AITER optimizations
+(attention, GEMM, normalization), torch.compile, hipBLASLt, and TunableOp:
+
+| Model | Parameters | tok/s | Configuration |
+|-------|-----------|-------|---------------|
+| Qwen2.5-0.5B-Instruct | 494M | 1059.8 | FULL graph + ALL AITER |
+| Qwen2.5-1.5B-Instruct | 1.5B | 391.6 | FULL graph + ALL AITER |
+
+These numbers represent steady-state decode throughput (8 concurrent
+prompts, 128 max tokens, after 2 warmup passes). The build patches in
+this repository are required — without them, gfx1151 is limited to
+~137 tok/s (0.5B) / ~44 tok/s (1.5B) due to Inductor codegen bugs
+that force PIECEWISE graph mode with AITER disabled.
+
 ## Why Build from Source?
 
 1. **gfx1151 is not in upstream ROCm** (as of ROCm 6.x / early 7.x).

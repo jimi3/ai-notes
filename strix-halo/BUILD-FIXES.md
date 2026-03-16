@@ -427,3 +427,109 @@ was removed from the build list.
 library pre-installed (30+ minute build with its own dependency tree). The
 PyPI binary uses runtime SIMD dispatch and detects AVX-512 at startup, so
 there's no meaningful gain from a source build.
+
+## vLLM Runtime Patches (Phase E, Step 20b)
+
+These patches fix runtime issues specific to gfx1151 (RDNA 3.5, wave32).
+They are applied after cloning vLLM and before building.
+
+### 30. AITER gate extension to gfx1x (Patches 1-2)
+
+**Symptom**: AITER optimizations (attention, GEMM, normalization) are
+silently disabled on gfx1151 — only eager PyTorch paths are used.
+
+**Root cause**: vLLM upstream gates AITER behind `on_gfx9()` checks
+(MI300X architecture family). gfx1151 is RDNA 3.5, not gfx9.
+
+**Fix**: Extend `is_aiter_found_and_supported()` in `_aiter_ops.py` and
+`supports_compute_capability()` in `rocm_aiter_fa.py` to accept
+`on_gfx1x()` alongside `on_gfx9()`. AITER has explicit gfx1151 tuning
+(chip_info.py enum 13, BLOCK_M/N=32, waves_per_eu=2).
+
+### 31. ViT attention revert to gfx9-only (Patch 3)
+
+**Symptom**: Vision Transformer (ViT) encoder attention crashes with
+"invalid argument for fmha_fwd" on gfx1151.
+
+**Root cause**: The CK fmha_fwd kernel rejects ViT-specific attention
+dimensions (head_dim/seq_len combinations) on gfx1151. The decoder
+attention path (unified + FA) works correctly on gfx1x, but the ViT
+encoder path cannot use CK attention.
+
+**Fix**: Keep ViT attention gated to `on_gfx9()` only. On gfx1151, ViT
+falls through to `TRITON_ATTN` which works correctly. If a previous build
+had extended the gate, this patch reverts it.
+
+### 32. FP8 linear disable on gfx1x (Patch 4)
+
+**Symptom**: GPU page fault crash during FP8 quantized inference.
+
+**Root cause**: CK GEMM kernels (`module_gemm_a8w8_blockscale`) compile
+for gfx1151 but use CDNA-specific MFMA (Matrix Fused Multiply-Add)
+instructions that don't exist on RDNA 3.5. The kernel executes illegal
+instructions, causing page faults.
+
+**Fix**: Add gfx1x guard to `is_linear_fp8_enabled()` in `_aiter_ops.py`.
+Returns `False` on RDNA 3.x, forcing vLLM to use its Triton blockscale
+GEMM fallback which generates correct gfx1151 kernels.
+
+### 33. AttrsDescriptor `__repr__` for Inductor codegen (Patch 5)
+
+**Symptom**: `SyntaxError` when loading torch.compile-generated Triton
+kernel files. torch.compile works on first run but fails on cache reload.
+
+**Root cause**: torch Inductor's codegen uses `{triton_meta!r}` to
+serialize kernel metadata into generated Python source. The ROCm Triton
+fork's `AttrsDescriptor` class has no `__repr__`, so Python falls back to
+`object.__repr__()` producing `<triton.backends.compiler.AttrsDescriptor
+object at 0x...>` — invalid Python syntax that causes `SyntaxError` when
+the generated file is re-imported.
+
+**Fix**: Add `__repr__` to `AttrsDescriptor` in
+`triton/backends/compiler.py` that produces valid, round-trippable Python
+via `from_dict()`. With this patch, `torch.compile` works correctly on
+gfx1151 — `--enforce-eager` is NOT required.
+
+### 34. Duplicate pattern registration crash (Patch 6)
+
+**Symptom**: `RuntimeError: Duplicate pattern` during torch.compile
+initialization with AITER fusion passes enabled.
+
+**Root cause**: `RocmAiterRMSNormQuantFusionPass` in
+`rocm_aiter_fusion.py` registers patterns in a loop over
+`epsilon x match_aiter_quant` combinations. Some combinations produce
+identical pattern graphs, and `torch._inductor.pattern_matcher` raises
+on duplicates.
+
+**Fix**: Add `skip_duplicates=True` to all `pm.register_replacement()`
+calls in the fusion pass.
+
+### 35. `+rms_norm` custom_ops block on gfx1x (Patch 7)
+
+**Symptom**: Model produces garbage/incoherent output with AITER enabled
+and torch.compile active. Correct output in eager mode.
+
+**Root cause**: When AITER RMSNorm is detected, vLLM's `rocm.py` adds
+`+rms_norm` to the `custom_ops` list. This tells torch.compile/Inductor
+to treat RMSNorm as an **opaque barrier** in the compute graph rather
+than an inline operation. On gfx1x (RDNA 3/4, wave32), Inductor generates
+incorrect code at the graph partition boundaries created by this barrier.
+
+Both the CK and Triton RMSNorm kernels are correct in isolation — the bug
+is purely in how Inductor restructures the compute graph when RMSNorm is
+declared as an opaque custom op. The effect is subtle: the model runs
+without errors but produces nonsensical output.
+
+**Fix**: Add `and not on_gfx1x()` guard to the `+rms_norm` insertion in
+`rocm.py`. RMSNorm stays inline in the Inductor graph and gets fused
+normally by the compiler. This was the single most impactful fix:
+
+| Model | Before (PIECEWISE, no AITER) | After (FULL graph, ALL AITER) | Speedup |
+|-------|------------------------------|-------------------------------|---------|
+| Qwen2.5-0.5B | 137.4 tok/s | 1059.8 tok/s | 7.7x |
+| Qwen2.5-1.5B | 44.2 tok/s | 391.6 tok/s | 8.9x |
+
+The speedup comes from enabling FULL CUDA graph capture (entire forward
+pass as a single HIPGraph) combined with ALL AITER optimizations
+(attention, GEMM, normalization). Previously, the `+rms_norm` bug forced
+PIECEWISE graph mode with AITER disabled.

@@ -1532,10 +1532,11 @@ with open('${init_file}', 'w') as f:
 # BLOCK_N=32, waves_per_eu=2). These patches extend the architecture checks
 # to include gfx1x (RDNA 3.x) alongside the existing gfx9 checks.
 #
-# Three files patched:
-#   1. _aiter_ops.py:is_aiter_found_and_supported() — master AITER gate
-#   2. rocm_aiter_fa.py:supports_compute_capability() — attention backend gate
-#   3. rocm.py:get_vit_attn_backend() — ViT attention backend selection
+# Two files patched, one reverted:
+#   1. _aiter_ops.py:is_aiter_found_and_supported() — master AITER gate (extend to gfx1x)
+#   2. rocm_aiter_fa.py:supports_compute_capability() — decoder attention gate (extend to gfx1x)
+#   3. rocm.py:get_vit_attn_backend() — ViT attention: KEEP gfx9-only (CK fmha_fwd
+#      rejects ViT dimensions on gfx1151; RDNA 3.5 falls through to TRITON_ATTN)
 patch_vllm_gfx1151() {
     log_step 20 "Patch vLLM for gfx1151 AITER support"
 
@@ -1559,13 +1560,93 @@ patch_vllm_gfx1151() {
         info "rocm_aiter_fa.py: already patched or pattern not found"
     fi
 
-    # Patch 3: rocm.py — extend ViT attention backend selection to accept gfx1x
+    # Patch 3: rocm.py — ViT attention: KEEP gfx9-only.
+    # The CK fmha_fwd kernel rejects ViT attention dimensions (head_dim,
+    # seq_len combos) on gfx1151 with "invalid argument for fmha_fwd".
+    # The AITER decoder attention (unified + FA) works fine on gfx1x, but
+    # the ViT encoder path must fall through to TRITON_ATTN on RDNA 3.5.
+    # No patch needed — the upstream code already uses on_gfx9() only.
+    # If a previous build applied the gfx1x extension, revert it.
     local _rocm_py="${VLLM_SRC}/vllm/platforms/rocm.py"
-    if [[ -f "${_rocm_py}" ]] && grep -q 'rocm_aiter_ops.is_enabled() and on_gfx9()' "${_rocm_py}"; then
-        info "Patching rocm.py: extending ViT attention backend to gfx1x"
-        sed -i 's/rocm_aiter_ops\.is_enabled() and on_gfx9()/rocm_aiter_ops.is_enabled() and (on_gfx9() or on_gfx1x())/' "${_rocm_py}"
+    if [[ -f "${_rocm_py}" ]] && grep -q 'rocm_aiter_ops.is_enabled() and (on_gfx9() or on_gfx1x())' "${_rocm_py}"; then
+        info "Reverting rocm.py ViT patch: gfx1x AITER FA causes 'invalid argument for fmha_fwd'"
+        sed -i 's/rocm_aiter_ops\.is_enabled() and (on_gfx9() or on_gfx1x())/rocm_aiter_ops.is_enabled() and on_gfx9()/' "${_rocm_py}"
     else
-        info "rocm.py: already patched or pattern not found"
+        info "rocm.py: ViT attention already gfx9-only (correct for gfx1151)"
+    fi
+
+    # Patch 4: _aiter_ops.py — disable AITER FP8 linear on gfx1x
+    # CK GEMM kernels (module_gemm_a8w8_blockscale) compile but crash at runtime
+    # with GPU page faults on RDNA 3.5 due to CDNA-specific MFMA instructions.
+    # Disabling AITER FP8 linear forces vLLM to use its Triton GEMM fallback.
+    if [[ -f "${_aiter_ops}" ]] && ! grep -q 'on_gfx1x.*is_linear_fp8' "${_aiter_ops}" \
+        && ! grep -q 'from vllm.platforms.rocm import on_gfx1x' "${_aiter_ops}"; then
+        info "Patching _aiter_ops.py: disable AITER FP8 linear on gfx1x (CK GEMM crash)"
+        sed -i '/def is_linear_fp8_enabled(cls) -> bool:/{
+            n
+            s|return cls.is_linear_enabled()|# RDNA 3.5 (gfx1x): CK GEMM kernels (module_gemm_a8w8_blockscale)\
+        # crash with GPU page faults due to CDNA-specific matrix instructions.\
+        # Disable AITER FP8 linear to fall through to vLLM Triton blockscale GEMM.\
+        from vllm.platforms.rocm import on_gfx1x\
+        if on_gfx1x():\
+            return False\
+        return cls.is_linear_enabled()|
+        }' "${_aiter_ops}"
+    else
+        info "_aiter_ops.py: FP8 linear gfx1x patch already applied"
+    fi
+
+    # Patch 5: triton/backends/compiler.py — add __repr__ to AttrsDescriptor
+    # torch Inductor codegen uses {triton_meta!r} to serialize kernel metadata
+    # into generated Triton source files.  AttrsDescriptor has no __repr__,
+    # so Python falls back to object.__repr__() producing angle-bracket output
+    # like <triton.backends.compiler.AttrsDescriptor object at 0x...> which is
+    # invalid Python syntax.  This causes SyntaxError when the generated kernel
+    # file is loaded.  With this patch, torch.compile with Inductor works
+    # correctly on gfx1151 — --enforce-eager is NOT required.
+    # Fix: add __repr__ that produces valid, round-trippable Python via from_dict().
+    local _triton_compiler
+    _triton_compiler="$(python -c "import triton.backends.compiler; print(triton.backends.compiler.__file__)")"
+    if [[ -f "${_triton_compiler}" ]] && ! grep -q '__repr__' "${_triton_compiler}"; then
+        info "Patching triton compiler.py: add __repr__ to AttrsDescriptor (Inductor codegen fix)"
+        sed -i '/def to_dict(self):/i\
+    def __repr__(self):\
+        return f'"'"'AttrsDescriptor.from_dict({self.to_dict()!r})'"'"'\
+' "${_triton_compiler}"
+    else
+        info "triton compiler.py: AttrsDescriptor __repr__ already present"
+    fi
+
+    # Patch 6: rocm_aiter_fusion.py — add skip_duplicates=True to pattern registration
+    # The RocmAiterRMSNormQuantFusionPass registers patterns in a loop over
+    # epsilon × match_aiter_quant combinations.  Some combinations produce
+    # identical pattern graphs, causing torch._inductor.pattern_matcher to
+    # raise "RuntimeError: Duplicate pattern" and crash the engine.
+    # Fix: add skip_duplicates=True to all pm.register_replacement calls.
+    local _aiter_fusion="${VLLM_SRC}/vllm/compilation/passes/fusion/rocm_aiter_fusion.py"
+    if [[ -f "${_aiter_fusion}" ]] && ! grep -q 'skip_duplicates' "${_aiter_fusion}"; then
+        info "Patching rocm_aiter_fusion.py: add skip_duplicates to pattern registration"
+        sed -i '/pm\.register_replacement(/,/)/{
+            s/pm_pass,$/pm_pass, skip_duplicates=True,/
+            s/pm_pass$/pm_pass, skip_duplicates=True/
+        }' "${_aiter_fusion}"
+    else
+        info "rocm_aiter_fusion.py: skip_duplicates already present"
+    fi
+
+    # Patch 7: rocm.py — block +rms_norm custom_ops on gfx1x
+    # On gfx1x (RDNA 3/4, wave32), adding +rms_norm to custom_ops causes
+    # torch.compile/Inductor to generate incorrect code at graph partition
+    # boundaries, producing garbage output.  Both CK and Triton RMSNorm
+    # kernels are correct in isolation; the bug is purely in how Inductor
+    # restructures the compute graph when RMSNorm is an opaque barrier.
+    # Fix: prevent +rms_norm from entering custom_ops on gfx1x.  RMSNorm
+    # stays inline in the Inductor graph and gets fused normally.
+    if [[ -f "${_rocm_py}" ]] && ! grep -q 'not on_gfx1x()' "${_rocm_py}"; then
+        info "Patching rocm.py: block +rms_norm custom_ops on gfx1x (Inductor codegen bug)"
+        sed -i '/and not is_eager_execution/a\            and not on_gfx1x()' "${_rocm_py}"
+    else
+        info "rocm.py: +rms_norm gfx1x guard already present"
     fi
 
     success "vLLM gfx1151 AITER patches applied"
