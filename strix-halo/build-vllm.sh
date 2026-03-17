@@ -78,35 +78,15 @@ set -euo pipefail
 _SCRIPT_REAL_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 _SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_REAL_PATH")" && pwd)"
 
-# Source shared helpers if available (platform context), otherwise
-# define minimal inline versions for standalone operation.
-_COMMON_SH="${_SCRIPT_DIR}/../lib/sh/common.sh"
-if [[ -f "${_COMMON_SH}" ]]; then
-    # shellcheck source=../lib/sh/common.sh
-    source "${_COMMON_SH}"
-else
-    info()    { printf '  \033[1;34minfo\033[0m  %s\n' "$*"; }
-    success() { printf '  \033[1;32m  ok\033[0m  %s\n' "$*"; }
-    warn()    { printf '  \033[1;33mwarn\033[0m  %s\n' "$*" >&2; }
-    error()   { printf '  \033[1;31m err\033[0m  %s\n' "$*" >&2; }
-    die()     { error "$@"; exit 1; }
-fi
-unset _COMMON_SH
-
-PLATFORM_DIR="${_SCRIPT_DIR}/.."
-
-# Portable vllm-env.sh sourcing: try platform layout, fall back to co-located.
-_vllm_source_env() {
-    local env="${PLATFORM_DIR}/scripts/vllm-env.sh"
-    [[ -f "${env}" ]] || env="${_SCRIPT_DIR}/vllm-env.sh"
-    # shellcheck source=vllm-env.sh
-    source "${env}"
-}
+# Source shared helpers (logging, section headers, prerequisite checks).
+# shellcheck source=common.sh
+source "${_SCRIPT_DIR}/common.sh"
 
 unset _SCRIPT_REAL_PATH
 
-# Source the vLLM environment (compiler flags, paths)
-_vllm_source_env
+# Source the vLLM environment (compiler flags, paths).
+# shellcheck source=vllm-env.sh
+source "${_SCRIPT_DIR}/vllm-env.sh"
 
 TOTAL_STEPS=32
 
@@ -3160,7 +3140,7 @@ warmup_tunableop() {
     fi
 
     # Source .env if available to get model configuration
-    local env_file="${PLATFORM_DIR}/.env"
+    local env_file="${_SCRIPT_DIR}/.env"
     if [[ ! -f "${env_file}" ]]; then
         info "No .env file found — skipping TunableOp warmup (requires model config)"
         info "Run 'vllm-start.sh' with TunableOp enabled to populate CSV on first inference"

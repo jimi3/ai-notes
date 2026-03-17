@@ -16,7 +16,7 @@
 #   - .env must be loaded (provides VLLM_ROLES and per-role config)
 #
 # Usage:
-#   source lib/sh/vllm-runtime-helpers.sh
+#   source "$(dirname "${BASH_SOURCE[0]}")/vllm-runtime-helpers.sh"
 
 # Guard: common.sh must be sourced first
 if ! declare -f info &>/dev/null; then

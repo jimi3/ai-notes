@@ -168,6 +168,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 | `vllm-start.sh` | Start all vLLM inference instances (role-based, multi-model) |
 | `vllm-stop.sh` | Stop all running vLLM instances (graceful SIGTERM + SIGKILL) |
 | `vllm-status.sh` | Check health/PID/model status of all vLLM instances |
+| `common.sh` | Shared shell helpers (logging, section headers, prerequisite checks) |
 | `vllm-runtime-helpers.sh` | Shared library for start/stop/status scripts |
 | `BUILD-FIXES.md` | Detailed documentation of all build patches and workarounds |
 
