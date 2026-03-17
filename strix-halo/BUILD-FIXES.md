@@ -533,3 +533,141 @@ The speedup comes from enabling FULL CUDA graph capture (entire forward
 pass as a single HIPGraph) combined with ALL AITER optimizations
 (attention, GEMM, normalization). Previously, the `+rms_norm` bug forced
 PIECEWISE graph mode with AITER disabled.
+
+### 36. Triton sampler page fault on gfx1151 (Patch 8)
+
+**Symptom**: GPU page fault during top-k/top-p sampling after torch.compile
+AOT compilation on RDNA 3.5.
+
+**Root cause**: The Triton top-k/top-p sampler kernel
+(`apply_top_k_top_p_triton`) page-faults on gfx1151 after ahead-of-time
+compilation by torch.compile. The kernel works in eager mode but the
+compiled version triggers an illegal memory access on RDNA 3.5's wave32
+architecture.
+
+**Fix**: Bypass the Triton sampler in
+`vllm/v1/sample/ops/topk_topp_sampler.py`. The PyTorch sort-based path
+(`topk` + `cumsum`) is functionally identical and works on all
+architectures.
+
+### 37. FLA chunk_delta_h autotuner + exp() type inference (Patch 9)
+
+**Symptom**: Two issues in FLA (Flash Linear Attention) Triton kernels:
+1. Page faults during autotuning with `num_stages>2` or `BV=64`
+2. Invalid IR from `exp()` type inference on HIP
+
+**Root cause**: The chunk_delta_h Triton kernel's autotuner tries pipeline
+depths (stages=2,3,4) and block sizes (BV=32,64) that exceed RDNA 3.5's
+register pressure limits, causing page faults. Separately, the HIP Triton
+compiler fails to infer types for `exp(scalar_bf16 - block_ptr_load_bf16)`,
+generating invalid intermediate representation.
+
+**Fix**:
+- Restrict AMD autotuning to `num_stages=2` and `BV=32` only (via
+  `is_amd` flag)
+- Cast `exp()` operands to `tl.float32` explicitly, which also improves
+  precision
+
+### 38. Qwen3.5 FLA warmup page fault for T < BT (Patch 10)
+
+**Symptom**: Page fault during Qwen3.5-next model warmup when FLA kernels
+are called with sequence lengths T=16 or T=32.
+
+**Root cause**: On RDNA 3.5 (wave32), `tl.make_block_ptr` page-faults when
+the sequence length T is less than the chunk size BT (64). HIP materializes
+the out-of-bounds address computation that CDNA (wave64) handles
+differently. The warmup loop iterates `T in (16, 32, 64)` but only T=64
+(where T==BT) is safe.
+
+**Fix**: Restrict the warmup loop in `qwen3_next.py` to `for T in (64,)`
+only.
+
+### 39. flash_attn_2_cuda import on ROCm (Patch 11)
+
+**Symptom**: `ModuleNotFoundError: flash_attn_2_cuda` when loading rotary
+embedding with flash_attn installed.
+
+**Root cause**: On ROCm, flash_attn is a pure-Python wheel that provides
+Triton-based kernels via `flash_attn.ops.triton.*` but does NOT include the
+CUDA native extension `flash_attn_2_cuda`. The import chain
+`flash_attn.ops.triton.rotary` -> `flash_attn_2_cuda` fails because the
+`.so` doesn't exist.
+
+**Fix**: Wrap the import in `rotary_embedding/common.py` with a try/except
+for `ImportError`/`ModuleNotFoundError`. When the native extension is
+absent, the Triton-based rotary path is still available through other code
+paths.
+
+### 40. AITER RMSNorm CK dispatch on gfx1x (Patch 12)
+
+**Symptom**: Illegal instruction crash during quantized inference when AITER
+RMSNorm is active on gfx1151.
+
+**Root cause**: The CK (Composable Kernel) RMSNorm implementations
+(`rocm_aiter.rmsnorm2d_fwd_with_dynamicquant` and
+`rmsnorm2d_fwd_with_add_dynamicquant`) use CDNA-specific assembly (MFMA
+instructions) that doesn't exist on RDNA 3.5. Additionally, the CK versions
+accept a `use_model_sensitive_rmsnorm=0` kwarg that the Triton versions
+don't.
+
+**Fix**: Add architecture dispatch in `_aiter_ops.py`. On `on_gfx1x()`, use
+the Triton RMSNorm from `aiter.ops.triton.normalization.rmsnorm` (which
+generates correct wave32 kernels). On gfx9 (CDNA), use the original CK path
+with the `use_model_sensitive_rmsnorm=0` kwarg.
+
+## AITER Source Rebuild (Phase F, Step 28b)
+
+### 41. AITER CK ABI mismatch
+
+**Symptom**: JIT compilation of AITER MHA kernels fails with ABI
+mismatches -- struct field types, missing members, narrowing conversion
+errors.
+
+**Root cause**: AITER's MHA (Multi-Head Attention) kernels use CK
+(Composable Kernel) tile headers for JIT compilation at runtime. The
+pip-installed aiter wheel includes pre-compiled `.cu` interface files built
+against a specific CK commit. If `CK_DIR` points to a different CK version,
+the compiled interfaces and runtime JIT headers disagree on struct layouts,
+causing compilation failures.
+
+**Fix**: Step 28b rebuilds AITER from the PyTorch submodule source tree
+(`pytorch/third_party/aiter`) with `CK_DIR` pointing to the matching CK
+submodule. This ensures the compiled `.cu` interfaces and CK headers are
+from the same commit. The stale JIT cache is cleared before rebuild.
+
+### 42. AITER vec_convert.h CDNA-only packed ISA (gfx1151 header patch)
+
+**Symptom**: JIT compilation fails with "invalid instruction" for AITER
+kernels that use packed FP8 conversion on gfx1151.
+
+**Root cause**: `ck_tile/vec_convert.h` contains three CDNA-only packed
+instructions:
+- `v_pk_mul_f32` (packed FP32 multiply, gfx940+ only)
+- `v_cvt_pk_fp8_f32` (packed FP8 convert, gfx942+ only)
+- `v_cvt_pk_bf8_f32` (packed BF8 convert, gfx942+ only)
+
+These are inline assembly instructions that RDNA 3/3.5 hardware cannot
+execute.
+
+**Fix**: Replace with architecture-dispatched code using
+`CK_TILE_RDNA3_NO_PK_FP8` preprocessor guard. On RDNA 3/3.5
+(`__gfx11xx__`), scalar C++ equivalents are used instead of packed assembly.
+
+### 43. AITER hip_reduce.h DPP broadcast instructions (gfx1151 header patch)
+
+**Symptom**: Illegal instruction during warp reduction operations in AITER
+kernels on gfx1151.
+
+**Root cause**: `hip_reduce.h` uses two DPP (Data Parallel Primitives)
+broadcast instructions:
+- `row_bcast:15` (0x142) -- cross-row broadcast, CDNA only
+- `row_bcast:31` (0x143) -- cross-half broadcast, CDNA only
+
+These DPP modes don't exist on RDNA, which uses a different warp shuffle
+mechanism.
+
+**Fix**: Replace with `ds_swizzle` (`warp_swizzle<T, 0x1e0>`) matching
+rocprim's own `warp_reduce_dpp.hpp` RDNA path. The `WarpSize > 32` path
+uses a `static_assert` since RDNA is wave32-only (CDNA is wave64). Patches
+target installed site-packages headers (not source tree) because AITER's
+JIT reads from the venv.

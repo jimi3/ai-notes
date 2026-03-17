@@ -29,6 +29,7 @@ Benchmarked with FULL CUDA graph capture, ALL AITER optimizations
 |-------|-----------|-------|---------------|
 | Qwen2.5-0.5B-Instruct | 494M | 1059.8 | FULL graph + ALL AITER |
 | Qwen2.5-1.5B-Instruct | 1.5B | 391.6 | FULL graph + ALL AITER |
+| Qwen3.5-0.8B (MoE) | 0.8B active / 3B total | 285.5 | enforce_eager (FLA kernels, see patches 9-10) |
 
 These numbers represent steady-state decode throughput (8 concurrent
 prompts, 128 max tokens, after 2 warmup passes). The build patches in
@@ -82,7 +83,7 @@ Phase E: Inference Engine
 
 Phase F: Attention (Flash Attention + AITER)
  25. Reinstall amdsmi      28. Build Flash Attention
- 26. Clone Flash Attention
+ 26. Clone Flash Attention  28b. Rebuild AITER from source (CK-aligned)
  27. Patch Flash Attention
 
 Phase G: Validation + Warmup
@@ -163,6 +164,7 @@ all 40+ target features including AVX-512, VAES, VPCLMULQDQ, GFNI, SHA.
 |------|-------------|
 | `build-vllm.sh` | Master build script (32-step pipeline) |
 | `vllm-env.sh` | Environment activation (compiler flags, ROCm paths, venv) |
+| `vllm-packages.yaml` | Package manifest (repos, branches, patches, build metadata) |
 | `vllm-start.sh` | Start all vLLM inference instances (role-based, multi-model) |
 | `vllm-stop.sh` | Stop all running vLLM instances (graceful SIGTERM + SIGKILL) |
 | `vllm-status.sh` | Check health/PID/model status of all vLLM instances |
@@ -190,7 +192,7 @@ upstream (the ROCm fork is deprecated).
 
 ## Output
 
-When complete, the build produces 12 optimized wheel packages:
+When complete, the build produces 13 optimized wheel packages:
 
 | Wheel | Size | Type |
 |-------|------|------|
@@ -206,6 +208,7 @@ When complete, the build produces 12 optimized wheel packages:
 | asyncpg | 845K | Cython |
 | orjson | 349K | Rust |
 | flash_attn | 206K | Pure Python |
+| amd-aiter | ~2M | C++/HIP |
 
 All wheels are in `/opt/src/vllm/wheels/` and can be installed into any
 Python 3.13 venv.
@@ -235,6 +238,7 @@ override-dependencies = [
     "torchvision==0.26.0a0+5328524",
     "vllm==0.17.1rc1.dev169+g6590a3ecd.d20260315.rocm713",
     "flash-attn==2.8.4",
+    "amd-aiter==0.1.0+gitabcdef",
     "amdsmi==26.3.0+093b66caa3.dirty",
     # Zen 5 optimized native wheels
     "numpy==2.4.3",
