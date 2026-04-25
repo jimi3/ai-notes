@@ -1970,6 +1970,14 @@ build_aotriton() {
     # AOTRITON_GPU_BUILD_TIMEOUT=0 disables the per-kernel timeout.
     uv pip install -r requirements.txt 2>/dev/null || pip install -r requirements.txt
 
+    # AOTriton bundles its own internal Triton at third_party/triton and
+    # invokes it via pip during ninja install. That inner Triton defaults
+    # to TRITON_CODEGEN_BACKENDS="nvidia;amd", but the cached LLVM under
+    # ~/.triton/llvm is built without the NVPTX targets, so MLIR's package
+    # config rejects the load. Restrict to the amd backend — gfx1151 has
+    # no use for NVIDIA codegen.
+    export TRITON_CODEGEN_BACKENDS=amd
+
     # Ensure vllm-env.sh flags are active (CC, CXX, AOTRITON_INSTALL_DIR, etc.)
     _vllm_source_env
     if [[ -z "${CFLAGS:-}" ]] || [[ -z "${CMAKE_CXX_FLAGS_RELEASE:-}" ]]; then
