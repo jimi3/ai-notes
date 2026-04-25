@@ -328,6 +328,22 @@ packages:
           Add missing <cstdint> include to elfio elf_types.hpp. Same
           transitive include removal as yaml-cpp above.
 
+      # 4b. Add <map> to RCCL transport/net.cc (transitive include removed)
+      - type: sed
+        file: "rocm-systems/projects/rccl/src/transport/net.cc"
+        marker: "<map>"
+        marker_absent: true
+        sed_command: '/#include "comm.h"/a #include <map>'
+        description: >
+          Add missing <map> include to RCCL transport/net.cc. RCCL
+          declares std::map<std::pair<std::string,std::string>,
+          rcclIBNicType> vendorNames at line ~240 but never includes
+          <map> directly. Clang 19+ stopped pulling <map> through the
+          transitive include chain from <string>/<utility>, so the file
+          fails with: "no member named 'map' in namespace 'std'". The
+          hipify rename turns this file into transport/net_tmp.cc in
+          the build tree, so the error surfaces there.
+
       # 5. Copy MLIR object libraries to install tree
       - type: file_copy
         src: "${THEROCK_SRC}/build/compiler/amd-llvm/stage/lib/llvm/lib/objects-Release"
