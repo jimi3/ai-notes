@@ -5211,8 +5211,20 @@ print("  Version: {}".format(getattr(_lem, "__version__", "unknown")))
     # Fix version pins: lemonade-sdk 9.1.4 pins strict versions that conflict with
     # vLLM's requirements (huggingface-hub==0.33.0, onnx==1.18.0, transformers<=4.53.2).
     # Reinstall at versions that satisfy vLLM. The SDK works fine with newer versions.
+    #
+    # IMPORTANT: --no-deps is required. Without it, pip's resolver sees the conflict
+    # between lemonade-sdk's strict pins and the requested newer versions, and resolves
+    # it by uninstalling lemonade-sdk entirely (observed silently on pip 25+). The
+    # failure mode is subtle: the package looks gone in `pip show` but the install
+    # logs higher up succeed, so the next time the venv is queried Lemonade is
+    # missing. tokenizers is included because lemonade-sdk pins it old too, and the
+    # downgrade breaks transformers 4.57.
     info "Fixing dependency version conflicts (lemonade-sdk strict pins vs vLLM)..."
-    pip install "transformers>=4.56.0,<5" "huggingface-hub>=0.36.0,<1" "onnx>=1.19.0,<=1.19.0" 2>&1 || true
+    pip install --no-deps --upgrade \
+        "transformers>=4.56.0,<5" \
+        "huggingface-hub>=0.36.0,<1" \
+        "onnx==1.19.0" \
+        "tokenizers>=0.22.0,<1" 2>&1 || true
 
     # Verify binaries are discoverable
     info "Verifying Lemonade can find llama.cpp binaries..."
